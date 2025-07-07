@@ -8,6 +8,11 @@ import logging
 from datetime import datetime
 import openai
 import yfinance as yf
+# Set custom User-Agent for yfinance HTTP requests
+import requests
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+YF_SESSION = requests.Session()
+YF_SESSION.headers.update({"User-Agent": USER_AGENT})
 import mibian
 # Handle OpenAI exception imports
 try:
@@ -35,7 +40,8 @@ def init_logging():
 
 # Prompt template
 PROMPT = r"""
-You are an institutional-grade options strategist.
+You are an institutional-grade options strategist with 50+ years of experience. Based on the metrics provided,
+please complete the below tasks in a manner that has a strong chance of high performance without being overly risky.
 Input JSON (preceding this prompt) contains:
 {  "date": "YYYY-MM-DD",
    "available_cash": 10000.00,
@@ -44,8 +50,8 @@ Input JSON (preceding this prompt) contains:
    "options_chain": { /* IV, greeks per option */ }
 }
 Task:
-1. Manage existing positions – close if needed.
-2. Propose 0–5 new defined-risk option trades (once per day).
+1. Manage existing positions – close any if needed
+2. Propose 0–5 new defined-risk option trades (note: script will be ran only once per day).
 Allowed strategies: long_option, vertical_spread, cash_secured_put, covered_call,
  iron_condor, iron_butterfly, straddle, strangle, calendar_spread, diagonal_spread.
 Return a JSON array (0–5) of trade objects only, no extra text. Schema:
@@ -77,6 +83,7 @@ def get_client(a_key, a_sec, paper: bool):
 # Fetch context: positions, market_data, options_chain
 def fetch_context(client) -> dict:
     logger.info("Fetching account and market data")
+
     acct = client.get_account()
     cash = float(acct.cash)
     positions = []
@@ -88,25 +95,26 @@ def fetch_context(client) -> dict:
             'strategy': 'long_option' if is_option_symbol(p.symbol) else 'stock'
         })
 
-    symbols = ['AAPL','GOOG','MSFT','NVDA','GME','TSLA','SPY','AMZN','META','PLTR','HOOD','ORCL','AMD','AVGO','NFLX','COIN','INTC','CRWD']
+    symbols = ['AAPL','GOOG','MSFT','NVDA','GME','TSLA','SPY','AMZN','META',
+               'PLTR','HOOD','ORCL','AMD','AVGO','NFLX','COIN','INTC','CRWD']
+
+        # Fetch underlying market data via Alpaca bars (1-min)
     market_data = {}
     for sym in symbols:
         try:
-            ticker = yf.Ticker(sym)
-            info = ticker.info
-            price = info.get('regularMarketPrice')
-            bid = info.get('bid')
-            ask = info.get('ask')
-            mid = (bid + ask) / 2 if bid and ask else None
-            spread = ask - bid if bid and ask else None
-            market_data[sym] = {
-                'price': price,
-                'timestamp': datetime.utcnow().isoformat(),
-                'bid': bid,
-                'ask': ask,
-                'mid': mid,
-                'spread': spread
-            }
+            df = client.get_bars(sym, TimeFrame.Minute, limit=1).df
+            if not df.empty:
+                last = df.iloc[-1]
+                price = float(last['close'])
+                timestamp = last.name.to_pydatetime().isoformat()
+                market_data[sym] = {
+                    'price': price,
+                    'timestamp': timestamp,
+                    'bid': None,
+                    'ask': None,
+                    'mid': None,
+                    'spread': None
+                }
         except Exception as e:
             logger.warning(f"Error fetching market data for {sym}: {e}")
     logger.info(f"Market data fetched for {len(market_data)} symbols")
@@ -115,9 +123,21 @@ def fetch_context(client) -> dict:
     import time, math
     for sym in market_data:
         try:
-            ticker = yf.Ticker(sym)
+            ticker = yf.Ticker(sym, session=YF_SESSION)
             opt_data = []
-            for exp in ticker.options:
+                        # yfinance option_chain requests to Yahoo API (per expiration)
+            # Example URL: https://query2.finance.yahoo.com/v7/finance/options/{sym}?date={epoch}
+            exps = ticker.options[:3]  # limit to next 3 expirations to reduce rate load
+            for exp in exps:
+                # skip if expiration is today or elapsed to avoid zero-time divide
+                try:
+                    days = (datetime.strptime(exp, '%Y-%m-%d') - datetime.utcnow()).days
+                except Exception:
+                    continue
+                if days <= 0:
+                    logger.debug(f"Skipping expiry {exp} for {sym} (days={days})")
+                    continue
+                # Now fetch chain and compute greeks
                 chain = ticker.option_chain(exp)
                 for df, kind in [(chain.calls, 'C'), (chain.puts, 'P')]:
                     for r in df.itertuples():
@@ -130,8 +150,24 @@ def fetch_context(client) -> dict:
                         oi = int(oi_raw) if oi_raw and not math.isnan(oi_raw) else 0
                         iv_raw = getattr(r, 'impliedVolatility', None)
                         iv = float(iv_raw) if iv_raw and not math.isnan(iv_raw) else 0.0
-                        days = (datetime.strptime(exp, '%Y-%m-%d') - datetime.utcnow()).days
-                        d = mibian.BS([market_data[sym]['price'], r.strike, 0, days], volatility=iv*100)
+                                                # calculate Black-Scholes greeks
+                        try:
+                            d = mibian.BS([market_data[sym]['price'], r.strike, 0, days], volatility=iv*100)
+                        except ZeroDivisionError:
+                            logger.debug(f"Skipping {r.contractSymbol} due to zero days to expiry")
+                            continue
+                        # append option data
+                        opt_data.append({
+                            'contract_symbol': r.contractSymbol,
+                            'implied_volatility': iv,
+                            'open_interest': oi,
+                            'delta': d.callDelta if kind=='C' else d.putDelta,
+                            'theta': d.callTheta if kind=='C' else d.putTheta,
+                            'bid': bid_o,
+                            'ask': ask_o,
+                            'mid': mid_o,
+                            'spread': ask_o - bid_o
+                        })([market_data[sym]['price'], r.strike, 0, days], volatility=iv*100)
                         opt_data.append({
                             'contract_symbol': r.contractSymbol,
                             'implied_volatility': iv,
@@ -197,101 +233,80 @@ def submit_orders(client, trades, paper_mode):
     except Exception:
         logger.warning("Could not fetch market clock; defaulting to closed for options")
         is_open = False
-    import requests
     log_file = 'trade_log.csv'
     write_header = not os.path.exists(log_file)
     base = 'https://paper-api.alpaca.markets' if paper_mode else 'https://api.alpaca.markets'
     order_url = f"{base}/v2/orders"
     headers = {
         'APCA-API-KEY-ID': os.getenv("ALPACA_API_KEY"),
-        'APCA-API-SECRET-KEY': os.getenv("ALPACA_SECRET_KEY"),
-        'Content-Type': 'application/json'
+        'APCA-API-SECRET-KEY': os.getenv("ALPACA_SECRET_KEY")
     }
     with open(log_file, 'a', newline='') as f:
         w = csv.writer(f)
         if write_header:
-            w.writerow(['timestamp','action','strategy','underlying','contract_symbol','qty','side','order_type','limit_price','time_in_force','order_id','status','error'])
-        for t in trades:
-            action = t['action']
-            strategy = t['strategy']
-            tif = t.get('time_in_force','day')
-            for leg in t['legs']:
-                qty = abs(int(leg.get('quantity', leg.get('qty', 1))))
-                side = leg.get('action', action)
+            w.writerow(['timestamp','action','strategy','symbol','contract','qty','side','type','limit_price','time_in_force','order_id','status','error'])
+        for trade in trades:
+            action = trade['action']
+            strategy = trade['strategy']
+            tif = trade['time_in_force']
+            for leg in trade['legs']:
+                sym = leg['symbol']
+                qty = abs(int(leg.get('quantity',1)))
+                side_raw = leg.get('action', action)
+                # normalize side to 'buy' or 'sell' for Alpaca API
+                side = side_raw.split('_')[0]
                 ot = leg.get('order_type','market')
                 lp = leg.get('limit_price')
-                sym = leg['symbol']
-                is_opt = 'expiry' in leg and 'strike' in leg
+                is_opt = is_option_symbol(leg.get('contract_symbol', ''))
                 if is_opt:
                     exp = datetime.strptime(leg['expiry'], '%Y-%m-%d')
                     ds = exp.strftime('%y%m%d')
-                    kind = 'C' if leg['type'] == 'call' else 'P'
-                    strike_int = int(float(leg['strike']) * 1000)
+                    kind = 'C' if leg['type']=='call' else 'P'
+                    strike_int = int(float(leg['strike'])*1000)
                     cs = f"{sym}{ds}{kind}{strike_int:08d}"
-                    params = {
-                        'symbol': cs,
-                        'qty': qty,
-                        'side': side,
-                        'type': ot,
-                        'time_in_force': tif
-                    }
-                    if ot == 'limit' and lp is not None:
+                    params = {'symbol':cs,'qty':qty,'side':side,'type':ot,'time_in_force':'day'}
+                    if ot=='limit' and lp is not None:
                         params['limit_price'] = lp
-                    if ot == 'market' and not is_open:
+                    if ot=='market' and not is_open:
                         logger.error(f"Cannot place market option order for {cs} when market is closed. Skipping.")
-                        w.writerow([datetime.utcnow().isoformat(), action, strategy, sym, cs, qty, side, ot, lp or '', tif, '', 'skipped', 'market closed'])
+                        w.writerow([datetime.utcnow().isoformat(),action,strategy,sym,cs,qty,side,ot,lp or '', 'day', '', 'skipped', 'market closed'])
                         continue
                     logger.info(f"Placing option order via REST: {params}")
                     try:
-                        resp = requests.post(order_url, json=params, headers=headers)
+                        resp = requests.post(order_url,json=params,headers=headers)
                         logger.info(f"Option order HTTP {resp.status_code}: {resp.text}")
                         data = resp.json() if resp.headers.get('Content-Type','').startswith('application/json') else {}
                         oid = data.get('id','')
                         status = data.get('status','')
-                        error = '' if resp.status_code in (200,201) else data.get('message',resp.text)
-                        if error:
-                            logger.error(f"Option order error: {error}")
+                        err = '' if resp.status_code in (200,201) else data.get('message',resp.text)
+                        if err:
+                            logger.error(f"Option order error: {err}")
+                        w.writerow([datetime.utcnow().isoformat(),action,strategy,sym,cs,qty,side,ot,lp or '', 'day',oid,status,err])
                     except Exception as e:
-                        oid, status, error = '','',str(e)
-                        logger.error(f"Option order HTTP error: {error}")
+                        logger.error(f"Option order HTTP error: {e}")
+                        w.writerow([datetime.utcnow().isoformat(),action,strategy,sym,cs,qty,side,ot,lp or '', 'day','', '', str(e)])
                 else:
-                    cs = sym
-                    params = {'symbol': cs, 'qty': qty, 'side': side, 'type': ot, 'time_in_force': tif}
-                    if ot == 'limit' and lp is not None:
+                    params = {'symbol':sym,'qty':qty,'side':side,'type':ot,'time_in_force':tif}
+                    if ot=='limit' and lp is not None:
                         params['limit_price'] = lp
-                    logger.info(f"Placing equity order via SDK: {params}")
+                    logger.info(f"Placing equity order: {params}")
                     try:
-                        order = client.submit_order(**params)
-                        oid, status, error = order.id, order.status, ''
-                        logger.info(f"Equity order accepted id={oid}, status={status}")
+                        o = client.submit_order(**params)
+                        logger.info(f"Order submitted: id={o.id}, status={o.status}")
+                        w.writerow([datetime.utcnow().isoformat(),action,strategy,sym,'',qty,side,ot,lp or '',tif,o.id,o.status,''])
                     except Exception as e:
-                        oid, status, error = '','',str(e)
-                        logger.error(f"Equity order error: {error}")
-                contract_symbol = cs
-                w.writerow([datetime.utcnow().isoformat(), action, strategy, sym, contract_symbol, qty, side, ot, lp or '', tif, oid, status, error])
+                        logger.error(f"Order error for {sym}: {e}")
+                        w.writerow([datetime.utcnow().isoformat(),action,strategy,sym,'',qty,side,ot,lp or '',tif,'','',str(e)])
 
-if __name__=='__main__':
+# Main
+if __name__ == '__main__':
     init_logging()
-    p = argparse.ArgumentParser()
-    p.add_argument('--mode', choices=['paper','live'], default='paper')
-    p.add_argument('--model', default='gpt-4.1')
-    args = p.parse_args()
-    logger.info(f"Mode={args.mode}, Model={args.model}")
-    key, sec = load_env()
-    client = get_client(key, sec, args.mode=='paper')
-    logger.info("\n===== FETCH CONTEXT =====")
+    parser = argparse.ArgumentParser(description='Auto Trading Bot')
+    parser.add_argument('--mode', choices=['paper','live'], default='paper')
+    parser.add_argument('--model', default='gpt-4.1')
+    args = parser.parse_args()
+    a_key,a_sec = load_env()
+    client = get_client(a_key,a_sec,args.mode=='paper')
     ctx = fetch_context(client)
-    logger.info(json.dumps(ctx, indent=2))
-    logger.info("\n===== MODEL QUERY =====")
-    trades = query_model(ctx, args.model)
-    logger.info("\n===== MODEL OUTPUT =====")
-    logger.info(json.dumps(trades, indent=2))
-    logger.info("\n===== RATIONALES =====")
-    for tr in trades:
-        legs = [leg['symbol'] for leg in tr['legs']]
-        logger.info(f"Rationale {legs}: {tr.get('rationale')}")
-    logger.info("\n===== ORDER SUBMISSION =====")
-    if trades:
-        submit_orders(client, trades, args.mode=='paper')
-    else:
-        logger.info("No trades to place")
+    trades = query_model(ctx,args.model)
+    submit_orders(client,trades,args.mode=='paper')
