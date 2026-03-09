@@ -1,0 +1,26 @@
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Trade data
+trade_log.csv
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
